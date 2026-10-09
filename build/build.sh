@@ -203,19 +203,22 @@ cmd_assemble() {
 bundle_libs() {
   log "bundle shared libs"
   mkdir -p "$STAGE/lib"
-  find "$STAGE" -type f -size +0 \( -perm -u+x -o -name '*.so*' \) -print0 |
+  local list="$WORK/libs.list" f l
+  : > "$list"
+  # pipefail/-e নিরাপদ: static বাইনারি (cloudflared) বা non-ELF এ ldd নন-জিরো দেয়, সেটা ব্যর্থতা নয়
   while IFS= read -r -d '' f; do
     file -b "$f" | grep -q '^ELF' || continue
-    LD_LIBRARY_PATH="$DEPS/luajit/lib" ldd "$f" 2>/dev/null | awk '/=> \//{print $3}'
-  done | sort -u |
+    { LD_LIBRARY_PATH="$DEPS/luajit/lib" ldd "$f" 2>/dev/null || true; } | awk '/=> \//{print $3}' >> "$list" || true
+  done < <(find "$STAGE" -type f -size +0 \( -perm -u+x -o -name '*.so*' \) -print0)
   while IFS= read -r l; do
+    [ -n "$l" ] && [ -e "$l" ] || continue
     case "$l" in "$STAGE"/*) continue ;; esac
     case "$(basename "$l")" in
       ld-linux*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libresolv.so*|libutil.so*|libnss_*|libanl.so*) continue ;;
     esac
     cp -L "$l" "$STAGE/lib/"
-  done
-  # ELF ফাইল যা এখনো "not found" দেখায় (mysql/node ইত্যাদি) সেগুলো LD_LIBRARY_PATH দিয়ে ম্যানেজার ঠিক করে
+  done < <(sort -u "$list")
+  rm -f "$list"
 }
 
 fix_rpaths() {
