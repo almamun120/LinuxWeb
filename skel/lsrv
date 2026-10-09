@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+# lsrv — portable web-stack manager (nginx · php · mysql · node · cloudflared)
+# এই ফোল্ডার যেখানেই থাকুক (এক্সটার্নাল ড্রাইভসহ) কাজ করবে: প্রতিবার স্টার্টে সব কনফিগ নতুন পাথ দিয়ে render হয়।
+set -uo pipefail
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"; ROOT="${SELF%/*}"; CONF="$ROOT/conf/lsrv.conf"
+
+BIND=0.0.0.0; HTTP_PORT=8080; HTTPS_PORT=8443; DEFAULT_PHP=8.3
+ENABLE_MYSQL=1; MYSQL_BIND=127.0.0.1; MYSQL_PORT=3306
+ENABLE_RTMP=0; RTMP_PORT=1935; ENABLE_RTMPS=0; RTMPS_PORT=1936; ENABLE_OTEL=0; RUN_USER=""; DATA_DIR=""
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+DATA="${DATA_DIR:-$ROOT/data}"; RUN="$ROOT/run"; LOGS="$ROOT/logs"; CFD="$ROOT/cloudflare"
+SOCK=""; RUN_GROUP=""; PHPVER=""; IFROOT_HASH="#"; IFROOT_SEMI=";"
+IS_ROOT=0; [ "$(id -u)" = 0 ] && IS_ROOT=1
+
+ok()   { printf '\033[32m✔\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31m✘ %s\033[0m\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------ environment
+resolve_user() {
+  if [ "$IS_ROOT" = 0 ]; then RUN_USER="$(id -un)"
+  elif [ -z "$RUN_USER" ]; then
+    RUN_USER="$(stat -c %U "$ROOT")"; [ "$RUN_USER" = root ] && RUN_USER=nobody
+  fi
+  RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo nogroup)"
+  if [ "$IS_ROOT" = 1 ]; then IFROOT_HASH=""; IFROOT_SEMI=""; fi
+}
+setup_env() {
+  export LSRV_ROOT="$ROOT" PATH="$ROOT/bin:$ROOT/node/bin:$PATH"
+  export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export OPENSSL_CONF="$ROOT/etc/openssl.cnf" SSL_CERT_FILE="$ROOT/etc/cacert.pem"
+}
+fs_type() { stat -f -c %T "$1" 2>/dev/null || echo unknown; }
+bad_fs()  { case "$1" in msdos|vfat|exfat|ntfs|ntfs3|fuseblk|cifs|smb*|9p|vboxsf) return 0;; esac; return 1; }
+
+# unix socket পাথ ১০৮ বাইট সীমা ও FAT/NTFS সমস্যা এড়াতে দরকারে /tmp ব্যবহার করে
+sock_dir() {
+  local d="$RUN"
+  if [ ${#d} -gt 60 ] || bad_fs "$(fs_type "$ROOT")"; then
+    d="/tmp/lsrv-$(printf '%s' "$ROOT" | md5sum | cut -c1-10)"
+  fi
+  mkdir -p -m 750 "$d"; [ "$IS_ROOT" = 1 ] && chown "$RUN_USER:$RUN_GROUP" "$d"
+  SOCK="$d"
+}
+init_runtime() { resolve_user; setup_env; mkdir -p "$RUN" "$LOGS"; sock_dir; }
+
+prepare_dirs() {
+  mkdir -p "$RUN"/nginx/sites "$RUN"/nginx/main.d "$RUN"/tmp/{client_body,proxy,fastcgi,uwsgi,scgi,mysql} \
+           "$RUN"/cache/proxy "$RUN"/live/hls "$RUN"/live/dash "$RUN"/sessions "$RUN"/php "$LOGS" "$DATA"/{mysql,ssl,geoip} "$ROOT/www" "$CFD"
+  chmod 700 "$CFD" 2>/dev/null
+  if [ "$IS_ROOT" = 1 ]; then chown -R "$RUN_USER:$RUN_GROUP" "$RUN" "$LOGS" "$DATA" 2>/dev/null; fi
+}
+
+check_env() {
+  local opts; opts="$(findmnt -n -o OPTIONS -T "$ROOT" 2>/dev/null || true)"
+  case ",$opts," in *,noexec,*) die "এই ড্রাইভ noexec মাউন্ট করা। চালাতে: sudo mount -o remount,exec <mountpoint>";; esac
+  bad_fs "$(fs_type "$ROOT")" && warn "ROOT ফাইলসিস্টেম $(fs_type "$ROOT") (exFAT/NTFS) — পারমিশন/সিমলিংক চলবে না; ext4/xfs/btrfs ভালো"
+  if [ "$ENABLE_MYSQL" = 1 ] && bad_fs "$(fs_type "$DATA")"; then
+    die "MySQL data ($DATA) FAT/NTFS-এ চলবে না। conf-এ DATA_DIR=/path/on/ext4 দিন অথবা ENABLE_MYSQL=0"
+  fi
+  case "$ROOT" in *" "*) warn "পাথে স্পেস আছে — চলবে, তবে এড়িয়ে চলা ভালো";; esac
+}
+
+# ------------------------------------------------------------ template rendering
+_sedscript() {
+  local k v
+  for k in ROOT RUN LOGS DATA SOCK BIND HTTP_PORT HTTPS_PORT RTMP_PORT RTMPS_PORT DEFAULT_PHP MYSQL_BIND MYSQL_PORT \
+           RUN_USER RUN_GROUP PHPVER IFROOT_HASH IFROOT_SEMI; do
+    v="$(printf '%s' "${!k-}" | sed -e 's/[\\&|]/\\&/g')"
+    printf 's|@%s@|%s|g\n' "$k" "$v"
+  done
+}
+render() { sed -f <(_sedscript) "$1" > "$2"; }
+
+# ------------------------------------------------------------ process helpers
+pid_alive() { [ -s "$1" ] && kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null; }
+stop_pidfile() {
+  local pf="$1" n=40 p; pid_alive "$pf" || { rm -f "$pf"; return 0; }
+  p="$(cat "$pf")"; kill -TERM "$p" 2>/dev/null
+  while [ $n -gt 0 ] && kill -0 "$p" 2>/dev/null; do sleep 0.5; n=$((n-1)); done
+  kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null
+  rm -f "$pf"
+}
+
+# ------------------------------------------------------------ wrappers in bin/
+mkwrap() { # name target(relative to ROOT)
+  local w="$ROOT/bin/$1"
+  cat > "$w" <<'W'
+#!/usr/bin/env bash
+R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+export LD_LIBRARY_PATH="$R/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" PATH="$R/node/bin:$PATH"
+export OPENSSL_CONF="$R/etc/openssl.cnf" SSL_CERT_FILE="$R/etc/cacert.pem"
+W
+  printf 'exec "$R/%s" "$@"\n' "$2" >> "$w"; chmod +x "$w"
+}
+relink() {
+  mkdir -p "$ROOT/bin"; local t v
+  for t in mysql mysqldump mysqladmin mysqlcheck mysqlimport mysqlbinlog; do [ -f "$ROOT/mysql/bin/$t" ] && mkwrap "$t" "mysql/bin/$t"; done
+  for t in node npm npx; do [ -e "$ROOT/node/bin/$t" ] && mkwrap "$t" "node/bin/$t"; done
+  [ -f "$ROOT/cloudflare/bin/cloudflared" ] && mkwrap cloudflared cloudflare/bin/cloudflared
+  [ -f "$ROOT/openssl/bin/openssl" ] && mkwrap openssl openssl/bin/openssl
+  cat > "$ROOT/bin/php" <<'W'
+#!/usr/bin/env bash
+R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+V="${LSRV_PHP:-}"
+[ -n "$V" ] || V="$(sed -n 's/^DEFAULT_PHP=\([0-9.]*\).*/\1/p' "$R/conf/lsrv.conf" | tail -1)"; V="${V:-8.3}"
+"$R/lsrv" _phpini "$V" || exit 1
+export LD_LIBRARY_PATH="$R/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$R/php/$V/bin/php" -c "$R/run/php/$V/php.ini" "$@"
+W
+  chmod +x "$ROOT/bin/php"
+  for v in $(php_installed); do
+    printf '#!/usr/bin/env bash\nLSRV_PHP=%s exec "$(dirname "$(readlink -f "$0")")/php" "$@"\n' "$v" > "$ROOT/bin/php$v"
+    chmod +x "$ROOT/bin/php$v"
+  done
+}
+
+# ------------------------------------------------------------ nginx
+nginx_cmd() { "$ROOT/nginx/sbin/nginx" -p "$ROOT/nginx/" -c "$RUN/nginx/nginx.conf" -e "$LOGS/nginx-error.log" "$@"; }
+nginx_render() {
+  rm -f "$RUN"/nginx/sites/*.conf "$RUN"/nginx/main.d/*.conf
+  render "$ROOT/conf/nginx/nginx.conf.tpl" "$RUN/nginx/nginx.conf"
+  local f
+  for f in "$ROOT"/conf/sites/*.conf; do [ -f "$f" ] && render "$f" "$RUN/nginx/sites/$(basename "$f")"; done
+  : > "$RUN/nginx/live-locations.conf"
+  if [ "$ENABLE_RTMP" = 1 ]; then
+    render "$ROOT/conf/nginx/main.d/rtmp.conf.tpl" "$RUN/nginx/main.d/rtmp.conf"
+    render "$ROOT/conf/nginx/live-locations.conf.tpl" "$RUN/nginx/live-locations.conf"
+    [ "$ENABLE_RTMPS" = 1 ] && render "$ROOT/conf/nginx/main.d/rtmps.conf.tpl" "$RUN/nginx/main.d/rtmps.conf"
+  fi
+  if [ "$ENABLE_OTEL" = 1 ] && [ -f "$ROOT/nginx/modules/ngx_otel_module.so" ]; then
+    render "$ROOT/conf/nginx/main.d/otel.conf.tpl" "$RUN/nginx/main.d/otel.conf"
+  fi
+}
+start_nginx() {
+  [ -x "$ROOT/nginx/sbin/nginx" ] || die "nginx নেই"
+  pid_alive "$RUN/nginx.pid" && { ok "nginx already running"; return; }
+  nginx_render; ensure_cert
+  nginx_cmd -t >"$RUN/nginx-test.log" 2>&1 || { cat "$RUN/nginx-test.log" >&2; die "nginx কনফিগ টেস্ট ব্যর্থ"; }
+  nginx_cmd && ok "nginx: http :$HTTP_PORT · https/h2/h3 :$HTTPS_PORT"
+}
+stop_nginx() { pid_alive "$RUN/nginx.pid" && { nginx_cmd -s quit; sleep 1; }; stop_pidfile "$RUN/nginx.pid"; ok "nginx stopped"; }
+reload_nginx() { nginx_render; nginx_cmd -t >/dev/null 2>&1 || { nginx_cmd -t; die "কনফিগ ভুল"; }; nginx_cmd -s reload && ok "nginx reloaded"; }
+
+# ------------------------------------------------------------ php-fpm
+php_installed() { local d; for d in "$ROOT"/php/*/; do [ -x "${d}sbin/php-fpm" ] && basename "$d"; done; }
+php_needed() {
+  { echo "$DEFAULT_PHP"; grep -ho 'php-[0-9]\+\.[0-9]\+\.sock' "$ROOT"/conf/sites/*.conf 2>/dev/null | sed 's/^php-//;s/\.sock$//'; } |
+    sort -uV | while read -r v; do [ -x "$ROOT/php/$v/sbin/php-fpm" ] && echo "$v"; done
+}
+php_render() {
+  PHPVER="$1"; mkdir -p "$RUN/php/$1"
+  render "$ROOT/conf/php/php.ini.tpl" "$RUN/php/$1/php.ini"
+  render "$ROOT/conf/php/php-fpm.conf.tpl" "$RUN/php/$1/php-fpm.conf"
+}
+start_php() {
+  local v extra=""; [ "$RUN_USER" = root ] && extra="-R"
+  for v in $(php_needed); do
+    pid_alive "$RUN/php-$v.pid" && { ok "php-fpm $v already running"; continue; }
+    php_render "$v"
+    # shellcheck disable=SC2086
+    "$ROOT/php/$v/sbin/php-fpm" $extra -p "$ROOT/php/$v" -y "$RUN/php/$v/php-fpm.conf" -c "$RUN/php/$v/php.ini" \
+      && ok "php-fpm $v" || warn "php-fpm $v চালু হয়নি (দেখুন: lsrv logs php-fpm-$v)"
+  done
+}
+stop_php() { local pf; for pf in "$RUN"/php-*.pid; do [ -f "$pf" ] && stop_pidfile "$pf"; done; ok "php-fpm stopped"; }
+
+# ------------------------------------------------------------ mysql
+MYSQLD="$ROOT/mysql/bin/mysqld"
+mysql_client_cnf() {
+  [ -f "$DATA/.mysql_root_pass" ] || return 0
+  ( umask 077; printf '[client]\nuser=root\npassword=%s\nsocket=%s/mysql.sock\n' "$(cat "$DATA/.mysql_root_pass")" "$SOCK" > "$RUN/mysql-client.cnf" )
+}
+start_mysql() {
+  [ "$ENABLE_MYSQL" = 1 ] || return 0
+  [ -x "$MYSQLD" ] || { warn "mysql ইনস্টল করা নেই"; return 0; }
+  pid_alive "$RUN/mysql.pid" && { ok "mysql already running"; return; }
+  render "$ROOT/conf/mysql/my.cnf.tpl" "$RUN/my.cnf"
+  local u=() first=0; [ "$IS_ROOT" = 1 ] && u=(--user="$RUN_USER")
+  if [ ! -d "$DATA/mysql/mysql" ]; then
+    echo "… MySQL data প্রথমবার তৈরি হচ্ছে"
+    "$MYSQLD" --defaults-file="$RUN/my.cnf" --initialize-insecure "${u[@]}" >>"$LOGS/mysql-init.log" 2>&1 \
+      || die "mysql initialize ব্যর্থ — দেখুন $LOGS/mysql-init.log"
+    first=1
+  fi
+  setsid nohup "$MYSQLD" --defaults-file="$RUN/my.cnf" "${u[@]}" >>"$LOGS/mysql-stdout.log" 2>&1 &
+  local i; for i in $(seq 1 120); do
+    "$ROOT/mysql/bin/mysqladmin" --no-defaults --protocol=socket --socket="$SOCK/mysql.sock" -uroot ping >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  [ -S "$SOCK/mysql.sock" ] || die "mysql চালু হয়নি — দেখুন $LOGS/mysql-error.log"
+  if [ "$first" = 1 ]; then
+    local pw; pw="$("$ROOT/openssl/bin/openssl" rand -hex 16)"
+    ( umask 077; echo "$pw" > "$DATA/.mysql_root_pass" )
+    "$ROOT/mysql/bin/mysql" --no-defaults -uroot --socket="$SOCK/mysql.sock" \
+      -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$pw'; FLUSH PRIVILEGES;" || warn "root পাসওয়ার্ড সেট হয়নি"
+    ok "MySQL root পাসওয়ার্ড: $DATA/.mysql_root_pass (শুধু আপনি পড়তে পারবেন)"
+  fi
+  mysql_client_cnf
+  ok "mysql: socket + $MYSQL_BIND:$MYSQL_PORT"
+}
+stop_mysql() {
+  pid_alive "$RUN/mysql.pid" || { ok "mysql not running"; return; }
+  mysql_client_cnf
+  "$ROOT/mysql/bin/mysqladmin" --defaults-file="$RUN/mysql-client.cnf" shutdown 2>/dev/null
+  stop_pidfile "$RUN/mysql.pid"; ok "mysql stopped"
+}
+cmd_mysql() {
+  local sub="${1:-shell}"; shift || true; mysql_client_cnf
+  case "$sub" in
+    shell)  exec "$ROOT/mysql/bin/mysql" --defaults-file="$RUN/mysql-client.cnf" "$@";;
+    dump)   exec "$ROOT/mysql/bin/mysqldump" --defaults-file="$RUN/mysql-client.cnf" "$@";;
+    backup) mkdir -p "$DATA/backup"; local f="$DATA/backup/all-$(date +%F_%H%M%S).sql.gz"
+            "$ROOT/mysql/bin/mysqldump" --defaults-file="$RUN/mysql-client.cnf" --all-databases --single-transaction --routines | gzip > "$f" && ok "$f";;
+    passwd) [ -n "${1:-}" ] || die "usage: lsrv mysql passwd NEWPASS"
+            "$ROOT/mysql/bin/mysql" --defaults-file="$RUN/mysql-client.cnf" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$1'" &&
+            ( umask 077; echo "$1" > "$DATA/.mysql_root_pass" ) && mysql_client_cnf && ok "root পাসওয়ার্ড বদলেছে";;
+    createdb) [ $# -ge 3 ] || die "usage: lsrv mysql createdb DB USER PASS"
+            "$ROOT/mysql/bin/mysql" --defaults-file="$RUN/mysql-client.cnf" -e \
+              "CREATE DATABASE IF NOT EXISTS \`$1\` CHARACTER SET utf8mb4; CREATE USER IF NOT EXISTS '$2'@'localhost' IDENTIFIED BY '$3'; GRANT ALL ON \`$1\`.* TO '$2'@'localhost'; FLUSH PRIVILEGES;" && ok "db=$1 user=$2";;
+    *) die "mysql: shell|dump|backup|passwd|createdb";;
+  esac
+}
+
+# ------------------------------------------------------------ cloudflare tunnel
+CFBIN="$CFD/bin/cloudflared"
+start_cloudflare() {
+  [ -x "$CFBIN" ] || { warn "cloudflared নেই"; return 0; }
+  pid_alive "$RUN/cloudflared.pid" && { ok "cloudflared already running"; return; }
+  export TUNNEL_ORIGIN_CERT="$CFD/cert.pem"
+  local mode=quick args=(); local quiet="${1:-}"
+  if [ -s "$CFD/token" ]; then mode=token; export TUNNEL_TOKEN; TUNNEL_TOKEN="$(cat "$CFD/token")"; args=(tunnel --no-autoupdate run)
+  elif [ -f "$CFD/config.yml.tpl" ]; then mode=config; render "$CFD/config.yml.tpl" "$RUN/cloudflared.yml"; args=(tunnel --no-autoupdate --config "$RUN/cloudflared.yml" run)
+  else
+    [ "$quiet" = quiet ] && return 0
+    args=(tunnel --no-autoupdate --url "http://127.0.0.1:$HTTP_PORT")
+  fi
+  : > "$LOGS/cloudflared.log"
+  setsid nohup "$CFBIN" "${args[@]}" >>"$LOGS/cloudflared.log" 2>&1 &
+  echo $! > "$RUN/cloudflared.pid"
+  ok "cloudflared ($mode)"
+  if [ "$mode" = quick ]; then
+    local i u; for i in $(seq 1 30); do
+      u="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$LOGS/cloudflared.log" | head -1)"; [ -n "$u" ] && { echo "   public URL: $u"; break; }; sleep 1
+    done
+  fi
+}
+stop_cloudflare() { stop_pidfile "$RUN/cloudflared.pid"; ok "cloudflared stopped"; }
+cmd_cf() {
+  case "${1:-help}" in
+    token) [ -n "${2:-}" ] || die "usage: lsrv cf token <TUNNEL_TOKEN>"; mkdir -p "$CFD"; ( umask 077; printf '%s' "$2" > "$CFD/token" ); ok "token saved → lsrv restart cloudflare";;
+    login) export TUNNEL_ORIGIN_CERT="$CFD/cert.pem"; exec "$CFBIN" tunnel login;;
+    quick) stop_cloudflare >/dev/null; rm -f "$CFD/token"; start_cloudflare;;
+    start|stop|status) "${1}_cloudflare" 2>/dev/null || cmd_status;;
+    cmd)   shift; export TUNNEL_ORIGIN_CERT="$CFD/cert.pem"; exec "$CFBIN" "$@";;
+    *) echo "lsrv cf token <T> | login | quick | start | stop | cmd <cloudflared args>"
+       echo "কাস্টম কনফিগ: cloudflare/config.yml.tpl রাখুন ( @ROOT@ প্লেসহোল্ডার চলবে )";;
+  esac
+}
+
+# ------------------------------------------------------------ ssl / geoip / perm
+ssl_gen() {
+  local cn="${1:-localhost}" c="$DATA/ssl/default.crt" k="$DATA/ssl/default.key"
+  mkdir -p "$DATA/ssl"
+  "$ROOT/openssl/bin/openssl" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+    -keyout "$k" -out "$c" -subj "/CN=$cn" \
+    -addext "subjectAltName=DNS:$cn,DNS:*.$cn,DNS:localhost,DNS:*.localhost,IP:127.0.0.1" >/dev/null 2>&1 || die "সার্টিফিকেট তৈরি ব্যর্থ"
+  chmod 600 "$k"; [ "$IS_ROOT" = 1 ] && chown "$RUN_USER:$RUN_GROUP" "$k" "$c"
+  ok "self-signed cert: $c"
+}
+ensure_cert() { [ -s "$DATA/ssl/default.crt" ] && [ -s "$DATA/ssl/default.key" ] || ssl_gen localhost; }
+cmd_geoip() {
+  [ "${1:-update}" = update ] || die "usage: lsrv geoip update"
+  local ym t; ym="$(date +%Y-%m)"; mkdir -p "$DATA/geoip"
+  for t in country city asn; do
+    curl -fsSL "https://download.db-ip.com/free/dbip-$t-lite-$ym.mmdb.gz" | gunzip > "$DATA/geoip/dbip-$t-lite.mmdb" && ok "dbip-$t-lite.mmdb" || warn "$t ব্যর্থ"
+  done
+}
+cmd_perm() {
+  case "${1:-fix}" in
+    fix)
+      find "$ROOT/bin" "$ROOT"/nginx/sbin "$ROOT"/php/*/bin "$ROOT"/php/*/sbin "$ROOT"/mysql/bin "$ROOT"/node/bin \
+           "$ROOT"/openssl/bin "$CFD/bin" -type f -exec chmod 755 {} + 2>/dev/null
+      chmod 755 "$ROOT/lsrv"
+      chmod 700 "$CFD" 2>/dev/null; chmod 600 "$CFD"/token "$CFD"/cert.pem "$CFD"/*.json 2>/dev/null
+      chmod 700 "$DATA/mysql" 2>/dev/null; chmod 600 "$DATA/.mysql_root_pass" "$DATA"/ssl/*.key 2>/dev/null
+      if [ "$IS_ROOT" = 1 ]; then chown -R "$RUN_USER:$RUN_GROUP" "$ROOT/www" "$DATA" "$RUN" "$LOGS" "$CFD"; ok "মালিকানা → $RUN_USER:$RUN_GROUP"
+      else ok "বাইনারি এক্সিকিউটেবল ও সিক্রেট ফাইল 600/700 করা হয়েছে (chown-এর জন্য root লাগে)"; fi;;
+    www) local p="${2:-$ROOT/www}"
+      find "$p" -type d -exec chmod 755 {} + ; find "$p" -type f -exec chmod 644 {} +
+      [ "$IS_ROOT" = 1 ] && chown -R "$RUN_USER:$RUN_GROUP" "$p"; ok "dirs 755 / files 644 → $p";;
+    show) ls -ld "$ROOT" "$ROOT/www" "$DATA" "$DATA/mysql" "$RUN" "$LOGS" "$CFD" 2>/dev/null;;
+    *) die "perm: fix | www [path] | show";;
+  esac
+}
+
+# ------------------------------------------------------------ sites
+cmd_site() {
+  case "${1:-ls}" in
+    add) shift; local name="${1:-}" type=php ver="$DEFAULT_PHP" dom="" port=""; shift || true
+      [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "usage: lsrv site add NAME [--php 8.2 | --static | --proxy PORT] [--domain example.com]"
+      while [ $# -gt 0 ]; do case "$1" in
+        --php) ver="$2"; shift 2;; --static) type=static; shift;; --proxy) type=proxy; port="$2"; shift 2;;
+        --domain) dom="$2"; shift 2;; *) die "অজানা অপশন $1";; esac; done
+      [ "$type" = php ] && [ ! -x "$ROOT/php/$ver/sbin/php-fpm" ] && die "PHP $ver নেই (lsrv php list)"
+      mkdir -p "$ROOT/www/$name"
+      sed -e "s|__NAME__|$name|g" -e "s|__SERVER__|${dom:-$name.localhost}|g" -e "s|__VER__|$ver|g" -e "s|__PORT__|$port|g" \
+        "$ROOT/conf/templates/site-$type.conf" > "$ROOT/conf/sites/$name.conf"
+      ok "site $name ($type) → https://${dom:-$name.localhost}:$HTTPS_PORT  root: www/$name"
+      echo "   রান করা থাকলে: lsrv reload  (নতুন PHP ভার্সন হলে lsrv restart php)";;
+    rm) [ -n "${2:-}" ] || die "usage: lsrv site rm NAME [--purge]"
+      rm -f "$ROOT/conf/sites/$2.conf"; [ "${3:-}" = --purge ] && rm -rf "${ROOT:?}/www/$2"; ok "removed $2";;
+    ls) local f; for f in "$ROOT"/conf/sites/*.conf; do
+          printf '%-18s %-28s %s\n' "$(basename "$f" .conf)" "$(sed -n 's/^ *server_name \(.*\);/\1/p' "$f" | head -1)" \
+            "$(grep -o 'php-[0-9.]*\.sock' "$f" | head -1 | sed 's/\.sock//;s/php-/php /')"; done;;
+    *) die "site: add | rm | ls";;
+  esac
+}
+
+cmd_php_admin() {
+  case "${1:-list}" in
+    list) local v; for v in $(php_installed); do [ "$v" = "$DEFAULT_PHP" ] && echo "$v  (default)" || echo "$v"; done;;
+    default) [ -x "$ROOT/php/${2:-x}/sbin/php-fpm" ] || die "PHP ${2:-?} নেই"; set_conf DEFAULT_PHP "$2"; ok "default PHP = $2 (lsrv restart)";;
+    ini) php_render "${2:-$DEFAULT_PHP}"; echo "$RUN/php/${2:-$DEFAULT_PHP}/php.ini";;
+    *) die "php: list | default VER | ini [VER]";;
+  esac
+}
+set_conf() { if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi; }
+
+# ------------------------------------------------------------ status / doctor / misc
+cmd_status() {
+  local v s
+  st() { if "$@"; then printf '  \033[32m●\033[0m running\n'; else printf '  \033[31m○\033[0m stopped\n'; fi; }
+  printf 'root: %s\n' "$ROOT"
+  printf 'nginx       '; st pid_alive "$RUN/nginx.pid"
+  for v in $(php_installed); do printf 'php-fpm %-4s ' "$v"; st pid_alive "$RUN/php-$v.pid"; done
+  printf 'mysql       '; st pid_alive "$RUN/mysql.pid"
+  printf 'cloudflared '; st pid_alive "$RUN/cloudflared.pid"
+}
+cmd_doctor() {
+  echo "glibc:   $(ldd --version 2>&1 | head -1)"
+  echo "root fs: $(fs_type "$ROOT")   data fs: $(fs_type "$DATA")"
+  findmnt -n -o OPTIONS -T "$ROOT" 2>/dev/null | grep -q noexec && warn "noexec মাউন্ট!" || ok "exec allowed"
+  [ "$(printf '%s' "$SOCK/mysql.sock" | wc -c)" -lt 100 ] && ok "socket path ছোট ($SOCK)" || warn "socket path বড়"
+  for p in "$HTTP_PORT" "$HTTPS_PORT" "$MYSQL_PORT"; do
+    ss -ltn 2>/dev/null | grep -q ":$p " && warn "পোর্ট $p ব্যস্ত" || ok "পোর্ট $p ফাঁকা"
+  done
+  [ "$HTTP_PORT" -lt 1024 ] && [ "$IS_ROOT" = 0 ] && warn "1024-এর নিচের পোর্টে root লাগে"
+  command -v curl >/dev/null || warn "host-এ curl নেই (geoip update লাগবে)"
+  "$ROOT/nginx/sbin/nginx" -V 2>&1 | tr ' ' '\n' | grep -E 'http_v3|brotli|lua|rtmp|geoip2|njs' | sort -u | tr '\n' ' '; echo
+}
+cmd_info() {
+  echo "nginx:  $("$ROOT/nginx/sbin/nginx" -v 2>&1)"; echo "php:    $(php_installed | tr '\n' ' ')"
+  echo "mysql:  $("$ROOT/mysql/bin/mysqld" --version 2>/dev/null | sed 's/.*Ver //')"; echo "node:   $("$ROOT/bin/node" -v 2>/dev/null)"
+  cat "$ROOT/BUILDINFO" 2>/dev/null
+}
+cmd_logs() {
+  local n="${1:-}"; [ -n "$n" ] || { ls "$LOGS"; return; }
+  local f; for f in "$LOGS/$n" "$LOGS/$n.log" "$LOGS/nginx-$n.log"; do
+    [ -f "$f" ] && { shift; exec tail -n 100 "${@:--f}" "$f"; }; done; die "লগ নেই: $n"
+}
+print_env() { cat <<E
+export LSRV_ROOT="$ROOT"
+export PATH="$ROOT/bin:$ROOT/node/bin:\$PATH"
+export LD_LIBRARY_PATH="$ROOT/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+E
+}
+
+svc_each() { # action services...
+  local act="$1"; shift; local s
+  for s in "$@"; do "${act}_$s" "${QUIET:-}"; done
+}
+resolve_targets() { case "${1:-all}" in all) echo "$2";; mysql|php|nginx|cloudflare) echo "$1";; *) die "অজানা সার্ভিস: $1 (mysql|php|nginx|cloudflare|all)";; esac; }
+
+usage() { cat <<'U'
+lsrv — portable web stack
+
+  start|stop|restart [mysql|php|nginx|cloudflare|all]     reload (nginx কনফিগ রিলোড)
+  status | doctor | info | logs [name] [-f]
+  site add NAME [--php VER|--static|--proxy PORT] [--domain D] | site rm NAME [--purge] | site ls
+  php list|default VER|ini [VER]      (CLI: bin/php, bin/php8.2 ...)
+  mysql shell|dump|backup|passwd|createdb ...
+  cf token <T> | quick | login | start | stop | cmd ...   (Cloudflare tunnel)
+  ssl gen [domain]  ·  geoip update  ·  perm fix|www [path]|show
+  config [set KEY VALUE]  ·  env (eval "$(lsrv env)" দিয়ে PATH এ যোগ)  ·  exec CMD...
+U
+}
+
+# ------------------------------------------------------------ main
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  help|-h|--help) usage; exit 0;;
+  relink) relink; exit 0;;
+  env)    print_env; exit 0;;
+  _phpini) init_runtime; prepare_dirs; php_render "$1"; exit 0;;
+esac
+init_runtime
+case "$cmd" in
+  start)   check_env; prepare_dirs; relink; t="$(resolve_targets "${1:-all}" "mysql php nginx cloudflare")"; QUIET=quiet; svc_each start $t;;
+  stop)    t="$(resolve_targets "${1:-all}" "cloudflare nginx php mysql")"; svc_each stop $t;;
+  restart) "$SELF" stop "${1:-all}"; "$SELF" start "${1:-all}";;
+  reload)  prepare_dirs; reload_nginx;;
+  status)  cmd_status;;
+  doctor)  cmd_doctor;;
+  info)    cmd_info;;
+  logs)    cmd_logs "$@";;
+  site)    cmd_site "$@";;
+  php)     cmd_php_admin "$@";;
+  mysql)   cmd_mysql "$@";;
+  cf|cloudflare) cmd_cf "$@";;
+  ssl)     prepare_dirs; ssl_gen "${2:-localhost}";;
+  geoip)   cmd_geoip "$@";;
+  perm)    cmd_perm "$@";;
+  config)  if [ "${1:-}" = set ]; then set_conf "$2" "$3"; ok "$2=$3"; else cat "$CONF"; fi;;
+  exec)    exec "$@";;
+  *) usage; exit 1;;
+esac

@@ -1,0 +1,27 @@
+[PHP]
+engine=On
+short_open_tag=Off
+memory_limit=256M
+max_execution_time=60
+post_max_size=128M
+upload_max_filesize=128M
+display_errors=Off
+log_errors=On
+error_reporting=E_ALL & ~E_DEPRECATED & ~E_STRICT
+error_log="@LOGS@/php-@PHPVER@-error.log"
+date.timezone=UTC
+extension_dir="@ROOT@/php/@PHPVER@/ext"
+sys_temp_dir="@RUN@/tmp"
+upload_tmp_dir="@RUN@/tmp"
+session.save_path="@RUN@/sessions"
+openssl.cafile="@ROOT@/etc/cacert.pem"
+curl.cainfo="@ROOT@/etc/cacert.pem"
+mysqli.default_socket="@SOCK@/mysql.sock"
+pdo_mysql.default_socket="@SOCK@/mysql.sock"
+zend_extension=opcache
+[opcache]
+opcache.enable=1
+opcache.enable_cli=0
+opcache.memory_consumption=128
+opcache.validate_timestamps=1
+opcache.revalidate_freq=2

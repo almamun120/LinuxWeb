@@ -1,0 +1,51 @@
+name: build-portable-stack
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: .work/dl
+          key: dl-${{ matrix.arch }}-${{ hashFiles('build/versions.env') }}
+
+      - name: Build (Ubuntu 20.04 container, glibc 2.31)
+        env:
+          LSRV_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('{0}-{1}', github.run_number, github.sha) }}
+        run: bash build/docker-build.sh
+
+      - name: Smoke test on a different distro (Debian 12, different path, then move)
+        run: bash build/smoke-test.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lsrv-${{ matrix.arch }}
+          path: dist/*.tar.xz*
+          compression-level: 0
+          retention-days: 14
+
+      - name: Release (only on v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.xz*

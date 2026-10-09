@@ -1,0 +1,17 @@
+[mysqld]
+basedir=@ROOT@/mysql
+datadir=@DATA@/mysql
+socket=@SOCK@/mysql.sock
+pid-file=@RUN@/mysql.pid
+log-error=@LOGS@/mysql-error.log
+tmpdir=@RUN@/tmp/mysql
+bind-address=@MYSQL_BIND@
+port=@MYSQL_PORT@
+mysqlx=OFF
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci
+innodb_buffer_pool_size=256M
+max_connections=100
+[client]
+socket=@SOCK@/mysql.sock
+default-character-set=utf8mb4
